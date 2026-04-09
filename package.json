@@ -1,0 +1,29 @@
+{
+  "name": "bulk-liquidation-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for BULK Exchange liquidation alerts",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.13.1",
+    "ws": "^8.18.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "bulk",
+    "exchange",
+    "liquidation",
+    "crypto"
+  ],
+  "author": "",
+  "license": "MIT"
+}
