@@ -184,7 +184,25 @@ No open positions found.
           const risk = this.calculateLiquidationRisk(pos, markPrice);
           
           const direction = pos.size > 0 ? '🟢 LONG' : '🔴 SHORT';
-          const riskEmoji = risk.distancePercent < 5 ? '🚨' : risk.distancePercent < 10 ? '⚠️' : '✅';
+          
+          // Risk emoji based on % toward liquidation
+          // < 0% or in profit = ✅, 50-80% = ⚠️, 80%+ = 🚨
+          let riskEmoji;
+          let riskStatus;
+          if (risk.rawPercentTowardLiquidation < 0) {
+            riskEmoji = '✅';
+            riskStatus = 'In Profit';
+          } else if (risk.percentTowardLiquidation < 50) {
+            riskEmoji = '✅';
+            riskStatus = `${risk.percentTowardLiquidation.toFixed(1)}% to liq`;
+          } else if (risk.percentTowardLiquidation < 80) {
+            riskEmoji = '⚠️';
+            riskStatus = `${risk.percentTowardLiquidation.toFixed(1)}% to liq`;
+          } else {
+            riskEmoji = '🚨';
+            riskStatus = `${risk.percentTowardLiquidation.toFixed(1)}% to liq`;
+          }
+          
           // Use notional from API if available, otherwise calculate
           const notionalValue = pos.notional || Math.abs(pos.size) * markPrice;
 
@@ -195,7 +213,7 @@ No open positions found.
 💲 Entry: $${formatNumberPrecise(pos.entryPrice)}
 📍 Mark: $${formatNumberPrecise(markPrice)}
 🎯 Liq Price: $${formatNumberPrecise(pos.liquidationPrice || risk.liquidationPrice)}
-${riskEmoji} Distance: *${risk.distancePercent.toFixed(2)}%*
+${riskEmoji} Risk: *${riskStatus}*
 💰 uPnL: ${pos.unrealizedPnl >= 0 ? '+' : ''}$${formatNumberPrecise(pos.unrealizedPnl)}
 
 `;
@@ -383,14 +401,16 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
   }
 
   // Calculate liquidation risk
+  // Measures how far price has moved from entry TOWARD liquidation
+  // 0% = at entry (safe), 100% = at liquidation (dead)
   calculateLiquidationRisk(position, markPrice) {
     const { entryPrice, size, liquidationPrice } = position;
+    const isLong = size > 0;
     
     // If no liquidation price provided, estimate it
     let liqPrice = liquidationPrice;
-    if (!liqPrice) {
+    if (!liqPrice || liqPrice === 0) {
       // Rough estimate based on 20x leverage, 0.5% maintenance margin
-      const isLong = size > 0;
       const maintenanceMargin = 0.005; // 0.5%
       if (isLong) {
         liqPrice = entryPrice * (1 - (1/20) + maintenanceMargin);
@@ -399,16 +419,49 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
       }
     }
     
-    const isLong = size > 0;
-    const distancePercent = isLong
-      ? ((markPrice - liqPrice) / markPrice) * 100
-      : ((liqPrice - markPrice) / markPrice) * 100;
+    // Calculate the total distance from entry to liquidation
+    const totalDistance = Math.abs(liqPrice - entryPrice);
+    
+    // Calculate how far price has moved from entry toward liquidation
+    let distanceTraveled;
+    let percentTowardLiquidation;
+    
+    if (isLong) {
+      // LONG: Entry is high, liq is low
+      // Price dropping = moving toward liquidation
+      // distanceTraveled = entryPrice - markPrice (positive when price drops)
+      distanceTraveled = entryPrice - markPrice;
+    } else {
+      // SHORT: Entry is low, liq is high  
+      // Price rising = moving toward liquidation
+      // distanceTraveled = markPrice - entryPrice (positive when price rises)
+      distanceTraveled = markPrice - entryPrice;
+    }
+    
+    // Calculate percentage toward liquidation
+    // Negative = in profit (price moved away from liq)
+    // 0% = at entry
+    // 100% = at liquidation
+    if (totalDistance > 0) {
+      percentTowardLiquidation = (distanceTraveled / totalDistance) * 100;
+    } else {
+      percentTowardLiquidation = 0;
+    }
+    
+    // isAtRisk when 80% or more toward liquidation (configurable via threshold)
+    // Default threshold is stored as "warn when X% toward liquidation"
+    const warningThreshold = 80; // Warn when 80% of the way to liquidation
+    const isAtRisk = percentTowardLiquidation >= warningThreshold;
     
     return {
       liquidationPrice: liqPrice,
       currentPrice: markPrice,
-      distancePercent: Math.max(0, distancePercent),
-      isAtRisk: distancePercent < 5
+      entryPrice: entryPrice,
+      percentTowardLiquidation: Math.max(0, percentTowardLiquidation), // Cap at 0 for display (in profit)
+      rawPercentTowardLiquidation: percentTowardLiquidation, // Can be negative (in profit)
+      isAtRisk: isAtRisk,
+      // For backwards compatibility, also include distance from liq price
+      distancePercent: Math.abs((liqPrice - markPrice) / markPrice) * 100
     };
   }
 
@@ -439,7 +492,7 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
             const markPrice = await this.bulkApi.getMarkPrice(pos.symbol);
             const risk = this.calculateLiquidationRisk(pos, markPrice);
 
-            // Alert if within 5% of liquidation
+            // Alert if 80% or more toward liquidation
             if (risk.isAtRisk) {
               // Check if we already alerted recently (prevent spam)
               const alertKey = `${user.chat_id}_${pos.symbol}`;
@@ -479,7 +532,7 @@ Your *${position.symbol}* ${direction} is at risk!
 🎯 Liq Price: $${formatNumberPrecise(risk.liquidationPrice)}
 ━━━━━━━━━━━━━━━━━━━
 
-🔥 *Only ${risk.distancePercent.toFixed(2)}% away from liquidation!*
+🔥 *${risk.percentTowardLiquidation.toFixed(1)}% of the way to liquidation!*
 
 Consider adding margin or reducing position size.
     `;
