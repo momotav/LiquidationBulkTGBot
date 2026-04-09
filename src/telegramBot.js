@@ -824,9 +824,14 @@ Consider adding margin or reducing position size.
 
   // Format liquidation message
   formatLiquidationMessage(liq) {
-    const isLongLiquidated = liq.side === 'buy';
+    // side="sell" → LONG liquidated (forced to sell their long)
+    // side="buy"  → SHORT liquidated (forced to buy back their short)
+    // Or use positionType if available
+    const positionType = liq.positionType || (liq.side === 'sell' ? 'LONG' : 'SHORT');
+    const isLongLiquidated = positionType === 'LONG';
+    
     const emoji = isLongLiquidated ? '🔴' : '🟢';
-    const direction = isLongLiquidated ? 'LONG' : 'SHORT';
+    const direction = positionType;
     const directionEmoji = isLongLiquidated ? '📉' : '📈';
 
     let sizeEmoji = '💰';
