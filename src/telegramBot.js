@@ -48,6 +48,28 @@ export class TelegramBotClient {
   }
 
   setupCommands() {
+    // Main menu keyboard
+    const mainMenuKeyboard = {
+      inline_keyboard: [
+        [
+          { text: '📊 Wallet Status', callback_data: 'wallet_status' },
+          { text: '🔗 Connect Wallet', callback_data: 'connect_wallet' }
+        ],
+        [
+          { text: '🔔 Alerts On', callback_data: 'alerts_on' },
+          { text: '🔕 Alerts Off', callback_data: 'alerts_off' }
+        ],
+        [
+          { text: '📈 Markets', callback_data: 'markets' },
+          { text: '📉 Status', callback_data: 'status' }
+        ],
+        [
+          { text: '❓ Help', callback_data: 'help' },
+          { text: '🗑️ Remove Wallet', callback_data: 'remove_wallet' }
+        ]
+      ]
+    };
+
     // /start command
     this.bot.onText(/\/start/, async (msg) => {
       const chatId = msg.chat.id;
@@ -65,23 +87,70 @@ export class TelegramBotClient {
 
 Welcome, ${firstName}!
 
-*Wallet Commands:*
-/wallet \`<address>\` - Connect your wallet
-/walletstatus - View your positions & liquidation risk
-/removewallet - Disconnect your wallet
-
-*Alert Settings:*
-/alerts - Toggle global liquidation feed on/off
-
-*Other Commands:*
-/status - Bot status
-/markets - Monitored markets
-/help - Help & info
+I'll notify you about liquidations on BULK Exchange and warn you when your positions are at risk.
 
 📊 *Monitoring:* ${config.bulk.markets.join(', ')}
+
+Use the menu below or type commands:
       `;
 
-      this.bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+      this.bot.sendMessage(chatId, welcomeMessage, { 
+        parse_mode: 'Markdown',
+        reply_markup: mainMenuKeyboard
+      });
+    });
+
+    // /menu command - Show menu anytime
+    this.bot.onText(/\/menu/, async (msg) => {
+      const chatId = msg.chat.id;
+      this.bot.sendMessage(chatId, '📋 *Main Menu*\n\nChoose an option:', { 
+        parse_mode: 'Markdown',
+        reply_markup: mainMenuKeyboard
+      });
+    });
+
+    // Handle button callbacks
+    this.bot.on('callback_query', async (query) => {
+      const chatId = query.message.chat.id;
+      const data = query.data;
+
+      // Acknowledge the button press
+      this.bot.answerCallbackQuery(query.id);
+
+      switch (data) {
+        case 'wallet_status':
+          await this.handleWalletStatus(chatId);
+          break;
+        case 'connect_wallet':
+          this.bot.sendMessage(chatId, `
+🔗 *Connect Your Wallet*
+
+Send your wallet address:
+\`/wallet <your_wallet_address>\`
+
+Example:
+\`/wallet 7xK9f2AbCdEf123456789...\`
+          `, { parse_mode: 'Markdown' });
+          break;
+        case 'alerts_on':
+          await this.handleAlertsToggle(chatId, true);
+          break;
+        case 'alerts_off':
+          await this.handleAlertsToggle(chatId, false);
+          break;
+        case 'markets':
+          await this.handleMarkets(chatId);
+          break;
+        case 'status':
+          await this.handleStatus(chatId);
+          break;
+        case 'help':
+          await this.handleHelp(chatId);
+          break;
+        case 'remove_wallet':
+          await this.handleRemoveWallet(chatId);
+          break;
+      }
     });
 
     // /wallet command - Add wallet
@@ -398,6 +467,229 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
       logger.error('Telegram polling error:', error.message);
       this.stats.errors++;
     });
+  }
+
+  // Handler for wallet status button
+  async handleWalletStatus(chatId) {
+    if (!this.useDatabase) {
+      this.bot.sendMessage(chatId, '❌ Database not available.');
+      return;
+    }
+
+    const user = await db.getUser(chatId);
+
+    if (!user || !user.wallet_address) {
+      this.bot.sendMessage(chatId, `
+❌ *No Wallet Connected*
+
+Use /wallet \`<address>\` to connect your wallet first.
+      `, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    // Send "loading" message
+    const loadingMsg = await this.bot.sendMessage(chatId, '🔄 Fetching your positions...');
+
+    try {
+      const positions = await this.bulkApi.getPositions(user.wallet_address);
+
+      if (!positions || positions.length === 0) {
+        await this.bot.editMessageText(`
+📊 *Wallet Status*
+
+📍 \`${shortenAddress(user.wallet_address)}\`
+
+No open positions found.
+        `, {
+          chat_id: chatId,
+          message_id: loadingMsg.message_id,
+          parse_mode: 'Markdown'
+        });
+        return;
+      }
+
+      // Build positions message
+      let positionsText = '';
+
+      for (const pos of positions) {
+        const markPrice = pos.markPrice || await this.bulkApi.getMarkPrice(pos.symbol);
+        const risk = this.calculateLiquidationRisk(pos, markPrice);
+        
+        const direction = pos.size > 0 ? '🟢 LONG' : '🔴 SHORT';
+        
+        let riskEmoji;
+        let riskStatus;
+        if (risk.rawPercentTowardLiquidation < 0) {
+          riskEmoji = '✅';
+          riskStatus = 'In Profit';
+        } else if (risk.percentTowardLiquidation < 50) {
+          riskEmoji = '✅';
+          riskStatus = `${risk.percentTowardLiquidation.toFixed(1)}% to liq`;
+        } else if (risk.percentTowardLiquidation < 80) {
+          riskEmoji = '⚠️';
+          riskStatus = `${risk.percentTowardLiquidation.toFixed(1)}% to liq`;
+        } else {
+          riskEmoji = '🚨';
+          riskStatus = `${risk.percentTowardLiquidation.toFixed(1)}% to liq`;
+        }
+        
+        const notionalValue = pos.notional || Math.abs(pos.size) * markPrice;
+
+        positionsText += `
+*${pos.symbol}* ${direction}
+━━━━━━━━━━━━━━━━━━━
+📊 Size: ${formatNumber(Math.abs(pos.size))} (${formatNumberPrecise(notionalValue)} USD)
+💲 Entry: $${formatNumberPrecise(pos.entryPrice)}
+📍 Mark: $${formatNumberPrecise(markPrice)}
+🎯 Liq Price: $${formatNumberPrecise(pos.liquidationPrice || risk.liquidationPrice)}
+${riskEmoji} Risk: *${riskStatus}*
+💰 uPnL: ${pos.unrealizedPnl >= 0 ? '+' : ''}$${formatNumberPrecise(pos.unrealizedPnl)}
+
+`;
+      }
+
+      await this.bot.editMessageText(`
+📊 *Wallet Status*
+
+📍 \`${shortenAddress(user.wallet_address)}\`
+
+${positionsText}
+_Updated: ${new Date().toUTCString()}_
+      `, {
+        chat_id: chatId,
+        message_id: loadingMsg.message_id,
+        parse_mode: 'Markdown'
+      });
+
+    } catch (error) {
+      logger.error('Error fetching positions:', error.message);
+      await this.bot.editMessageText(`
+❌ *Error Fetching Positions*
+
+Could not retrieve position data. Please try again later.
+      `, {
+        chat_id: chatId,
+        message_id: loadingMsg.message_id,
+        parse_mode: 'Markdown'
+      });
+    }
+  }
+
+  // Handler for alerts toggle
+  async handleAlertsToggle(chatId, enabled) {
+    if (!this.useDatabase) {
+      this.bot.sendMessage(chatId, '❌ Database not available.');
+      return;
+    }
+
+    await db.setGlobalAlerts(chatId, enabled);
+
+    const emoji = enabled ? '🔔' : '🔕';
+    this.bot.sendMessage(chatId, `
+${emoji} *Global Alerts: ${enabled ? 'ON' : 'OFF'}*
+
+${enabled 
+  ? 'You will receive alerts for ALL liquidations on BULK Exchange.' 
+  : 'You will only receive alerts for YOUR wallet (if connected).'}
+    `, { parse_mode: 'Markdown' });
+  }
+
+  // Handler for markets
+  async handleMarkets(chatId) {
+    const markets = config.bulk.markets.map((m) => `• ${m}`).join('\n');
+
+    this.bot.sendMessage(chatId, `
+📈 *Monitored Markets*
+
+${markets}
+
+These markets are tracked 24/7 for liquidation events.
+    `, { parse_mode: 'Markdown' });
+  }
+
+  // Handler for status
+  async handleStatus(chatId) {
+    const uptime = this.getUptime();
+    
+    let userStatus = '';
+    if (this.useDatabase) {
+      const user = await db.getUser(chatId);
+      if (user) {
+        userStatus = `
+*Your Settings:*
+📍 Wallet: ${user.wallet_address ? `\`${shortenAddress(user.wallet_address)}\`` : 'Not connected'}
+🔔 Global Alerts: ${user.global_alerts ? 'ON' : 'OFF'}
+`;
+      }
+    }
+
+    const subscriberCount = this.useDatabase ? await db.getSubscriberCount() : 0;
+
+    const statusMessage = `
+📊 *Bot Status*
+
+✅ Bot: Online
+⏱️ Uptime: ${uptime}
+💾 Database: ${this.useDatabase ? 'Connected' : 'Not available'}
+
+*Statistics:*
+👥 Total Users: ${subscriberCount}
+💀 Liquidations Tracked: ${this.stats.liquidationsProcessed}
+📨 Messages Sent: ${this.stats.messagesSent}
+${userStatus}
+📡 Monitoring ${config.bulk.markets.length} markets
+    `;
+
+    this.bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+  }
+
+  // Handler for help
+  async handleHelp(chatId) {
+    this.bot.sendMessage(chatId, `
+❓ *Help*
+
+*What does this bot do?*
+Monitors BULK Exchange for liquidations and alerts you in real-time.
+
+*Wallet Tracking:*
+Connect your wallet to get personal alerts when YOUR positions are at risk.
+
+• /wallet \`<address>\` - Connect wallet
+• /walletstatus - Check your positions
+• /removewallet - Disconnect wallet
+
+*Alert Types:*
+
+🔴 *LONG LIQUIDATED* - Someone's long got liquidated (price dropped)
+🟢 *SHORT LIQUIDATED* - Someone's short got liquidated (price rose)
+
+⚠️ *LIQUIDATION WARNING* - Your position is 80%+ toward liquidation
+
+*Size Indicators:*
+🐋 = $100k+ (Whale)
+🦈 = $50k-$100k 
+🐟 = $10k-$50k
+🦐 = Under $10k
+
+*Links:*
+• [BULK Exchange](https://alphanet.bulk.trade)
+• [Explorer](https://explorer.bulk.trade)
+    `, { parse_mode: 'Markdown', disable_web_page_preview: true });
+  }
+
+  // Handler for remove wallet
+  async handleRemoveWallet(chatId) {
+    if (this.useDatabase) {
+      await db.removeUserWallet(chatId);
+    }
+
+    this.bot.sendMessage(chatId, `
+✅ *Wallet Disconnected*
+
+You will no longer receive personal liquidation alerts.
+
+Use /wallet \`<address>\` to connect a new wallet.
+    `, { parse_mode: 'Markdown' });
   }
 
   // Calculate liquidation risk
