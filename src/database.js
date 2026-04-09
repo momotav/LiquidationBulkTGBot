@@ -6,13 +6,14 @@ const { Pool } = pg;
 class Database {
   constructor() {
     this.pool = null;
+    this.alertCache = new Map(); // In-memory cache for alert timestamps
   }
 
   async connect() {
     const connectionString = process.env.DATABASE_URL;
 
     if (!connectionString) {
-      logger.warn('DATABASE_URL not set - using in-memory storage (subscribers will be lost on restart)');
+      logger.warn('DATABASE_URL not set - running without database');
       return false;
     }
 
@@ -22,11 +23,9 @@ class Database {
         ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
       });
 
-      // Test connection
       await this.pool.query('SELECT NOW()');
       logger.info('✅ Connected to PostgreSQL');
 
-      // Create tables
       await this.initTables();
       return true;
     } catch (error) {
@@ -37,15 +36,19 @@ class Database {
 
   async initTables() {
     const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS subscribers (
+      CREATE TABLE IF NOT EXISTS users (
         chat_id BIGINT PRIMARY KEY,
         username VARCHAR(255),
         first_name VARCHAR(255),
-        subscribed_at TIMESTAMP DEFAULT NOW(),
-        is_active BOOLEAN DEFAULT TRUE
+        wallet_address VARCHAR(255),
+        global_alerts BOOLEAN DEFAULT TRUE,
+        alert_threshold DECIMAL DEFAULT 5.0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
       );
 
-      CREATE INDEX IF NOT EXISTS idx_subscribers_active ON subscribers(is_active);
+      CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_address);
+      CREATE INDEX IF NOT EXISTS idx_users_global_alerts ON users(global_alerts);
     `;
 
     try {
@@ -57,15 +60,16 @@ class Database {
     }
   }
 
+  // Add or update subscriber
   async addSubscriber(chatId, username, firstName) {
     if (!this.pool) return false;
 
     try {
       await this.pool.query(
-        `INSERT INTO subscribers (chat_id, username, first_name, is_active)
-         VALUES ($1, $2, $3, TRUE)
+        `INSERT INTO users (chat_id, username, first_name)
+         VALUES ($1, $2, $3)
          ON CONFLICT (chat_id) 
-         DO UPDATE SET is_active = TRUE, username = $2, first_name = $3`,
+         DO UPDATE SET username = $2, first_name = $3, updated_at = NOW()`,
         [chatId, username, firstName]
       );
       return true;
@@ -75,14 +79,12 @@ class Database {
     }
   }
 
+  // Remove subscriber
   async removeSubscriber(chatId) {
     if (!this.pool) return false;
 
     try {
-      await this.pool.query(
-        'UPDATE subscribers SET is_active = FALSE WHERE chat_id = $1',
-        [chatId]
-      );
+      await this.pool.query('DELETE FROM users WHERE chat_id = $1', [chatId]);
       return true;
     } catch (error) {
       logger.error('Failed to remove subscriber:', error.message);
@@ -90,46 +92,125 @@ class Database {
     }
   }
 
-  async isSubscribed(chatId) {
-    if (!this.pool) return false;
+  // Get user by chat ID
+  async getUser(chatId) {
+    if (!this.pool) return null;
 
     try {
       const result = await this.pool.query(
-        'SELECT is_active FROM subscribers WHERE chat_id = $1',
+        'SELECT * FROM users WHERE chat_id = $1',
         [chatId]
       );
-      return result.rows.length > 0 && result.rows[0].is_active;
+      return result.rows[0] || null;
     } catch (error) {
-      logger.error('Failed to check subscription:', error.message);
-      return false;
+      logger.error('Failed to get user:', error.message);
+      return null;
     }
   }
 
-  async getActiveSubscribers() {
+  // Get all users
+  async getAllUsers() {
     if (!this.pool) return [];
 
     try {
-      const result = await this.pool.query(
-        'SELECT chat_id FROM subscribers WHERE is_active = TRUE'
-      );
-      return result.rows.map(row => row.chat_id);
+      const result = await this.pool.query('SELECT * FROM users');
+      return result.rows;
     } catch (error) {
-      logger.error('Failed to get subscribers:', error.message);
+      logger.error('Failed to get all users:', error.message);
       return [];
     }
   }
 
+  // Get users with wallets connected
+  async getUsersWithWallets() {
+    if (!this.pool) return [];
+
+    try {
+      const result = await this.pool.query(
+        'SELECT * FROM users WHERE wallet_address IS NOT NULL'
+      );
+      return result.rows;
+    } catch (error) {
+      logger.error('Failed to get users with wallets:', error.message);
+      return [];
+    }
+  }
+
+  // Set user wallet
+  async setUserWallet(chatId, walletAddress) {
+    if (!this.pool) return false;
+
+    try {
+      await this.pool.query(
+        `UPDATE users SET wallet_address = $2, updated_at = NOW() WHERE chat_id = $1`,
+        [chatId, walletAddress]
+      );
+      return true;
+    } catch (error) {
+      logger.error('Failed to set user wallet:', error.message);
+      return false;
+    }
+  }
+
+  // Remove user wallet
+  async removeUserWallet(chatId) {
+    if (!this.pool) return false;
+
+    try {
+      await this.pool.query(
+        `UPDATE users SET wallet_address = NULL, updated_at = NOW() WHERE chat_id = $1`,
+        [chatId]
+      );
+      return true;
+    } catch (error) {
+      logger.error('Failed to remove user wallet:', error.message);
+      return false;
+    }
+  }
+
+  // Set global alerts preference
+  async setGlobalAlerts(chatId, enabled) {
+    if (!this.pool) return false;
+
+    try {
+      await this.pool.query(
+        `UPDATE users SET global_alerts = $2, updated_at = NOW() WHERE chat_id = $1`,
+        [chatId, enabled]
+      );
+      return true;
+    } catch (error) {
+      logger.error('Failed to set global alerts:', error.message);
+      return false;
+    }
+  }
+
+  // Get subscriber count
   async getSubscriberCount() {
     if (!this.pool) return 0;
 
     try {
-      const result = await this.pool.query(
-        'SELECT COUNT(*) FROM subscribers WHERE is_active = TRUE'
-      );
+      const result = await this.pool.query('SELECT COUNT(*) FROM users');
       return parseInt(result.rows[0].count, 10);
     } catch (error) {
       logger.error('Failed to get subscriber count:', error.message);
       return 0;
+    }
+  }
+
+  // Alert caching (in-memory to prevent spam)
+  async getLastAlert(key) {
+    return this.alertCache.get(key) || null;
+  }
+
+  async setLastAlert(key, timestamp) {
+    this.alertCache.set(key, timestamp);
+    
+    // Clean old entries (older than 10 minutes)
+    const tenMinutesAgo = Date.now() - 600000;
+    for (const [k, v] of this.alertCache.entries()) {
+      if (v < tenMinutesAgo) {
+        this.alertCache.delete(k);
+      }
     }
   }
 
