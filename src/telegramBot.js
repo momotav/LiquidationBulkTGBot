@@ -2,11 +2,12 @@ import TelegramBot from 'node-telegram-bot-api';
 import { config } from './config.js';
 import { logger, formatNumber, formatNumberPrecise, shortenAddress } from './logger.js';
 import { db } from './database.js';
+import { BulkAPI } from './bulkApi.js';
 
 export class TelegramBotClient {
   constructor() {
     this.bot = null;
-    this.subscribersCache = new Set(); // In-memory cache for fast lookups
+    this.bulkApi = new BulkAPI();
     this.useDatabase = false;
     this.stats = {
       messagesSent: 0,
@@ -14,6 +15,9 @@ export class TelegramBotClient {
       errors: 0,
       startTime: Date.now(),
     };
+    
+    // Position monitoring interval
+    this.monitoringInterval = null;
   }
 
   async initialize() {
@@ -23,11 +27,13 @@ export class TelegramBotClient {
       // Try to connect to database
       this.useDatabase = await db.connect();
       
-      // Load existing subscribers into cache
       if (this.useDatabase) {
-        const subscribers = await db.getActiveSubscribers();
-        subscribers.forEach(id => this.subscribersCache.add(id));
-        logger.info(`📋 Loaded ${subscribers.length} subscribers from database`);
+        // Load subscriber count
+        const count = await db.getSubscriberCount();
+        logger.info(`📋 Database connected. ${count} subscribers loaded.`);
+        
+        // Start position monitoring (check every 30 seconds)
+        this.startPositionMonitoring();
       }
       
       // Set up command handlers
@@ -42,96 +48,276 @@ export class TelegramBotClient {
   }
 
   setupCommands() {
-    // /start command - Subscribe to alerts
+    // /start command
     this.bot.onText(/\/start/, async (msg) => {
       const chatId = msg.chat.id;
       const username = msg.from.username || null;
       const firstName = msg.from.first_name || 'User';
       
-      // Add to database and cache
       if (this.useDatabase) {
         await db.addSubscriber(chatId, username, firstName);
       }
-      this.subscribersCache.add(chatId);
       
-      logger.info(`New subscriber: ${firstName} (@${username}) [${chatId}]`);
+      logger.info(`New user: ${firstName} (@${username}) [${chatId}]`);
 
       const welcomeMessage = `
 🔥 *BULK Exchange Liquidation Bot*
 
-Welcome, ${firstName}! You are now subscribed to real-time liquidation alerts.
+Welcome, ${firstName}!
 
-*Commands:*
-/start - Subscribe to liquidation alerts
-/stop - Unsubscribe from alerts
-/status - Bot status and your subscription
-/markets - Show monitored markets
-/help - Get help and info
+*Wallet Commands:*
+/wallet \`<address>\` - Connect your wallet
+/walletstatus - View your positions & liquidation risk
+/removewallet - Disconnect your wallet
+
+*Alert Settings:*
+/alerts - Toggle global liquidation feed on/off
+
+*Other Commands:*
+/status - Bot status
+/markets - Monitored markets
+/help - Help & info
 
 📊 *Monitoring:* ${config.bulk.markets.join(', ')}
-
-You'll receive alerts whenever a position gets liquidated on BULK Exchange! 💀
       `;
 
       this.bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
     });
 
-    // /stop command - Unsubscribe
-    this.bot.onText(/\/stop/, async (msg) => {
+    // /wallet command - Add wallet
+    this.bot.onText(/\/wallet(?:\s+(.+))?/, async (msg, match) => {
       const chatId = msg.chat.id;
-      
-      if (this.subscribersCache.has(chatId)) {
-        // Remove from database and cache
-        if (this.useDatabase) {
-          await db.removeSubscriber(chatId);
-        }
-        this.subscribersCache.delete(chatId);
-        
-        logger.info(`Unsubscribed: ${chatId}`);
-        
+      const walletAddress = match[1]?.trim();
+
+      if (!walletAddress) {
         this.bot.sendMessage(chatId, `
-✅ *Unsubscribed*
+📝 *Connect Your Wallet*
 
-You will no longer receive liquidation alerts.
+Usage: \`/wallet <your_wallet_address>\`
 
-Send /start to subscribe again anytime!
+Example:
+\`/wallet 7xK9f2AbCdEf123456789...\`
+
+Once connected, you'll receive:
+• ⚠️ Alerts when close to liquidation
+• 💀 Notification if you get liquidated
         `, { parse_mode: 'Markdown' });
-      } else {
-        this.bot.sendMessage(chatId, `
-You're not currently subscribed.
-
-Send /start to subscribe to liquidation alerts!
-        `, { parse_mode: 'Markdown' });
+        return;
       }
+
+      // Validate wallet format (basic check - Solana addresses are 32-44 chars)
+      if (walletAddress.length < 32 || walletAddress.length > 50) {
+        this.bot.sendMessage(chatId, `
+❌ *Invalid Wallet Address*
+
+Please enter a valid Solana wallet address.
+        `, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      if (this.useDatabase) {
+        await db.setUserWallet(chatId, walletAddress);
+      }
+
+      logger.info(`Wallet connected: ${chatId} -> ${shortenAddress(walletAddress)}`);
+
+      this.bot.sendMessage(chatId, `
+✅ *Wallet Connected!*
+
+📍 \`${shortenAddress(walletAddress)}\`
+
+You will now receive:
+• ⚠️ Alerts when within 5% of liquidation
+• 💀 Notification if your position gets liquidated
+
+Use /walletstatus to check your positions anytime.
+      `, { parse_mode: 'Markdown' });
+    });
+
+    // /walletstatus command - Check positions
+    this.bot.onText(/\/walletstatus/, async (msg) => {
+      const chatId = msg.chat.id;
+
+      if (!this.useDatabase) {
+        this.bot.sendMessage(chatId, '❌ Database not available.');
+        return;
+      }
+
+      const user = await db.getUser(chatId);
+
+      if (!user || !user.wallet_address) {
+        this.bot.sendMessage(chatId, `
+❌ *No Wallet Connected*
+
+Use /wallet \`<address>\` to connect your wallet first.
+        `, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      // Send "loading" message
+      const loadingMsg = await this.bot.sendMessage(chatId, '🔄 Fetching your positions...');
+
+      try {
+        const positions = await this.bulkApi.getPositions(user.wallet_address);
+
+        if (!positions || positions.length === 0) {
+          await this.bot.editMessageText(`
+📊 *Wallet Status*
+
+📍 \`${shortenAddress(user.wallet_address)}\`
+
+No open positions found.
+          `, {
+            chat_id: chatId,
+            message_id: loadingMsg.message_id,
+            parse_mode: 'Markdown'
+          });
+          return;
+        }
+
+        // Build positions message
+        let positionsText = '';
+
+        for (const pos of positions) {
+          const markPrice = await this.bulkApi.getMarkPrice(pos.symbol);
+          const risk = this.calculateLiquidationRisk(pos, markPrice);
+          
+          const direction = pos.size > 0 ? '🟢 LONG' : '🔴 SHORT';
+          const riskEmoji = risk.distancePercent < 5 ? '🚨' : risk.distancePercent < 10 ? '⚠️' : '✅';
+          const notionalValue = Math.abs(pos.size) * markPrice;
+
+          positionsText += `
+*${pos.symbol}* ${direction}
+━━━━━━━━━━━━━━━━━━━
+📊 Size: ${formatNumber(Math.abs(pos.size))} (${formatNumberPrecise(notionalValue)} USD)
+💲 Entry: $${formatNumberPrecise(pos.entryPrice)}
+📍 Mark: $${formatNumberPrecise(markPrice)}
+🎯 Liq Price: $${formatNumberPrecise(risk.liquidationPrice)}
+${riskEmoji} Distance: *${risk.distancePercent.toFixed(2)}%*
+💰 uPnL: ${pos.unrealizedPnl >= 0 ? '+' : ''}$${formatNumberPrecise(pos.unrealizedPnl)}
+
+`;
+        }
+
+        await this.bot.editMessageText(`
+📊 *Wallet Status*
+
+📍 \`${shortenAddress(user.wallet_address)}\`
+
+${positionsText}
+_Updated: ${new Date().toUTCString()}_
+        `, {
+          chat_id: chatId,
+          message_id: loadingMsg.message_id,
+          parse_mode: 'Markdown'
+        });
+
+      } catch (error) {
+        logger.error('Error fetching positions:', error.message);
+        await this.bot.editMessageText(`
+❌ *Error Fetching Positions*
+
+Could not retrieve position data. Please try again later.
+
+Error: ${error.message}
+        `, {
+          chat_id: chatId,
+          message_id: loadingMsg.message_id,
+          parse_mode: 'Markdown'
+        });
+      }
+    });
+
+    // /removewallet command
+    this.bot.onText(/\/removewallet/, async (msg) => {
+      const chatId = msg.chat.id;
+
+      if (this.useDatabase) {
+        await db.removeUserWallet(chatId);
+      }
+
+      this.bot.sendMessage(chatId, `
+✅ *Wallet Disconnected*
+
+You will no longer receive personal liquidation alerts.
+
+Use /wallet \`<address>\` to connect a new wallet.
+      `, { parse_mode: 'Markdown' });
+    });
+
+    // /alerts command - Toggle global alerts
+    this.bot.onText(/\/alerts(?:\s+(on|off))?/, async (msg, match) => {
+      const chatId = msg.chat.id;
+      const setting = match[1]?.toLowerCase();
+
+      if (!this.useDatabase) {
+        this.bot.sendMessage(chatId, '❌ Database not available.');
+        return;
+      }
+
+      const user = await db.getUser(chatId);
+      const currentSetting = user?.global_alerts ?? true;
+
+      if (!setting) {
+        // Show current status
+        const statusEmoji = currentSetting ? '🔔' : '🔕';
+        this.bot.sendMessage(chatId, `
+*Global Liquidation Alerts*
+
+${statusEmoji} Currently: *${currentSetting ? 'ON' : 'OFF'}*
+
+• \`/alerts on\` - Receive ALL liquidation alerts
+• \`/alerts off\` - Only receive YOUR wallet alerts
+
+${!user?.wallet_address ? '⚠️ _No wallet connected. Use /wallet to track your positions._' : ''}
+        `, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const newSetting = setting === 'on';
+      await db.setGlobalAlerts(chatId, newSetting);
+
+      const emoji = newSetting ? '🔔' : '🔕';
+      this.bot.sendMessage(chatId, `
+${emoji} *Global Alerts: ${newSetting ? 'ON' : 'OFF'}*
+
+${newSetting 
+  ? 'You will receive alerts for ALL liquidations on BULK Exchange.' 
+  : 'You will only receive alerts for YOUR wallet (if connected).'}
+      `, { parse_mode: 'Markdown' });
     });
 
     // /status command
     this.bot.onText(/\/status/, async (msg) => {
       const chatId = msg.chat.id;
       const uptime = this.getUptime();
-      const isSubscribed = this.subscribersCache.has(chatId);
       
-      const subscriberCount = this.useDatabase 
-        ? await db.getSubscriberCount() 
-        : this.subscribersCache.size;
+      let userStatus = '';
+      if (this.useDatabase) {
+        const user = await db.getUser(chatId);
+        if (user) {
+          userStatus = `
+*Your Settings:*
+📍 Wallet: ${user.wallet_address ? `\`${shortenAddress(user.wallet_address)}\`` : 'Not connected'}
+🔔 Global Alerts: ${user.global_alerts ? 'ON' : 'OFF'}
+`;
+        }
+      }
 
-      const storageType = this.useDatabase ? '💾 PostgreSQL' : '⚡ In-Memory';
+      const subscriberCount = this.useDatabase ? await db.getSubscriberCount() : 0;
 
       const statusMessage = `
 📊 *Bot Status*
 
 ✅ Bot: Online
 ⏱️ Uptime: ${uptime}
-${storageType}
-
-*Your Status:*
-${isSubscribed ? '🔔 Subscribed to alerts' : '🔕 Not subscribed'}
+💾 Database: ${this.useDatabase ? 'Connected' : 'Not available'}
 
 *Statistics:*
-👥 Active Subscribers: ${subscriberCount}
-💀 Liquidations Processed: ${this.stats.liquidationsProcessed}
+👥 Total Users: ${subscriberCount}
+💀 Liquidations Tracked: ${this.stats.liquidationsProcessed}
 📨 Messages Sent: ${this.stats.messagesSent}
-
+${userStatus}
 📡 Monitoring ${config.bulk.markets.length} markets
       `;
 
@@ -143,54 +329,48 @@ ${isSubscribed ? '🔔 Subscribed to alerts' : '🔕 Not subscribed'}
       const chatId = msg.chat.id;
       const markets = config.bulk.markets.map((m) => `• ${m}`).join('\n');
 
-      const marketsMessage = `
+      this.bot.sendMessage(chatId, `
 📈 *Monitored Markets*
 
 ${markets}
 
-These markets are tracked 24/7 for liquidation events on BULK Exchange.
-      `;
-
-      this.bot.sendMessage(chatId, marketsMessage, { parse_mode: 'Markdown' });
+These markets are tracked 24/7 for liquidation events.
+      `, { parse_mode: 'Markdown' });
     });
 
     // /help command
     this.bot.onText(/\/help/, (msg) => {
       const chatId = msg.chat.id;
-      const helpMessage = `
+      this.bot.sendMessage(chatId, `
 ❓ *Help*
 
-This bot monitors BULK Exchange for liquidation events and sends you real-time alerts.
+*What does this bot do?*
+Monitors BULK Exchange for liquidations and alerts you in real-time.
 
-*What is a liquidation?*
-A liquidation occurs when a trader's position can no longer be supported by their margin. The exchange automatically closes the position.
+*Wallet Tracking:*
+Connect your wallet to get personal alerts when YOUR positions are at risk.
 
-*Understanding alerts:*
-🔴 = Long position liquidated (price dropped)
-🟢 = Short position liquidated (price rose)
+• /wallet \`<address>\` - Connect wallet
+• /walletstatus - Check your positions
+• /removewallet - Disconnect wallet
 
-*Size indicators:*
+*Alert Types:*
+
+🔴 *LONG LIQUIDATED* - Someone's long got liquidated (price dropped)
+🟢 *SHORT LIQUIDATED* - Someone's short got liquidated (price rose)
+
+⚠️ *LIQUIDATION WARNING* - Your position is within 5% of liquidation price
+
+*Size Indicators:*
 🐋 = $100k+ (Whale)
-🦈 = $50k-$100k (Shark)
-🐟 = $10k-$50k (Fish)
-🦐 = Under $10k (Shrimp)
-
-*Commands:*
-/start - Subscribe to alerts
-/stop - Unsubscribe
-/status - Check status
-/markets - View markets
-/help - This message
+🦈 = $50k-$100k 
+🐟 = $10k-$50k
+🦐 = Under $10k
 
 *Links:*
 • [BULK Exchange](https://alphanet.bulk.trade)
 • [Explorer](https://explorer.bulk.trade)
-      `;
-
-      this.bot.sendMessage(chatId, helpMessage, { 
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true 
-      });
+      `, { parse_mode: 'Markdown', disable_web_page_preview: true });
     });
 
     // Handle errors
@@ -200,32 +380,134 @@ A liquidation occurs when a trader's position can no longer be supported by thei
     });
   }
 
+  // Calculate liquidation risk
+  calculateLiquidationRisk(position, markPrice) {
+    const { entryPrice, size, liquidationPrice } = position;
+    
+    // If no liquidation price provided, estimate it
+    let liqPrice = liquidationPrice;
+    if (!liqPrice) {
+      // Rough estimate based on 20x leverage, 0.5% maintenance margin
+      const isLong = size > 0;
+      const maintenanceMargin = 0.005; // 0.5%
+      if (isLong) {
+        liqPrice = entryPrice * (1 - (1/20) + maintenanceMargin);
+      } else {
+        liqPrice = entryPrice * (1 + (1/20) - maintenanceMargin);
+      }
+    }
+    
+    const isLong = size > 0;
+    const distancePercent = isLong
+      ? ((markPrice - liqPrice) / markPrice) * 100
+      : ((liqPrice - markPrice) / markPrice) * 100;
+    
+    return {
+      liquidationPrice: liqPrice,
+      currentPrice: markPrice,
+      distancePercent: Math.max(0, distancePercent),
+      isAtRisk: distancePercent < 5
+    };
+  }
+
+  // Start position monitoring loop
+  startPositionMonitoring() {
+    // Check positions every 30 seconds
+    this.monitoringInterval = setInterval(async () => {
+      await this.checkAllUserPositions();
+    }, 30000);
+
+    logger.info('📡 Position monitoring started (30s interval)');
+  }
+
+  // Check all user positions for liquidation risk
+  async checkAllUserPositions() {
+    if (!this.useDatabase) return;
+
+    try {
+      const usersWithWallets = await db.getUsersWithWallets();
+
+      for (const user of usersWithWallets) {
+        try {
+          const positions = await this.bulkApi.getPositions(user.wallet_address);
+          
+          if (!positions || positions.length === 0) continue;
+
+          for (const pos of positions) {
+            const markPrice = await this.bulkApi.getMarkPrice(pos.symbol);
+            const risk = this.calculateLiquidationRisk(pos, markPrice);
+
+            // Alert if within 5% of liquidation
+            if (risk.isAtRisk) {
+              // Check if we already alerted recently (prevent spam)
+              const alertKey = `${user.chat_id}_${pos.symbol}`;
+              const lastAlert = await db.getLastAlert(alertKey);
+              const now = Date.now();
+
+              // Only alert once per 5 minutes per position
+              if (!lastAlert || (now - lastAlert) > 300000) {
+                await this.sendLiquidationWarning(user.chat_id, pos, markPrice, risk);
+                await db.setLastAlert(alertKey, now);
+              }
+            }
+          }
+        } catch (error) {
+          logger.error(`Error checking positions for ${user.chat_id}:`, error.message);
+        }
+      }
+    } catch (error) {
+      logger.error('Error in position monitoring:', error.message);
+    }
+  }
+
+  // Send liquidation warning to user
+  async sendLiquidationWarning(chatId, position, markPrice, risk) {
+    const direction = position.size > 0 ? 'LONG' : 'SHORT';
+    const notionalValue = Math.abs(position.size) * markPrice;
+
+    const message = `
+⚠️🚨 *LIQUIDATION WARNING* 🚨⚠️
+
+Your *${position.symbol}* ${direction} is at risk!
+
+━━━━━━━━━━━━━━━━━━━
+📊 Size: $${formatNumberPrecise(notionalValue)}
+💲 Entry: $${formatNumberPrecise(position.entryPrice)}
+📍 Current: $${formatNumberPrecise(markPrice)}
+🎯 Liq Price: $${formatNumberPrecise(risk.liquidationPrice)}
+━━━━━━━━━━━━━━━━━━━
+
+🔥 *Only ${risk.distancePercent.toFixed(2)}% away from liquidation!*
+
+Consider adding margin or reducing position size.
+    `;
+
+    try {
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+      this.stats.messagesSent++;
+      logger.info(`⚠️ Liquidation warning sent to ${chatId} for ${position.symbol}`);
+    } catch (error) {
+      logger.error(`Failed to send warning to ${chatId}:`, error.message);
+    }
+  }
+
+  // Format liquidation message
   formatLiquidationMessage(liq) {
-    // Direction: buy side means a long was liquidated, sell means short was liquidated
     const isLongLiquidated = liq.side === 'buy';
     const emoji = isLongLiquidated ? '🔴' : '🟢';
     const direction = isLongLiquidated ? 'LONG' : 'SHORT';
     const directionEmoji = isLongLiquidated ? '📉' : '📈';
 
-    // Size emoji based on value
     let sizeEmoji = '💰';
-    if (liq.value >= 100000) {
-      sizeEmoji = '🐋';
-    } else if (liq.value >= 50000) {
-      sizeEmoji = '🦈';
-    } else if (liq.value >= 10000) {
-      sizeEmoji = '🐟';
-    } else {
-      sizeEmoji = '🦐';
-    }
+    if (liq.value >= 100000) sizeEmoji = '🐋';
+    else if (liq.value >= 50000) sizeEmoji = '🦈';
+    else if (liq.value >= 10000) sizeEmoji = '🐟';
+    else sizeEmoji = '🦐';
 
-    // Extract token from symbol
     const token = liq.symbol.split('-')[0];
-
-    // Format timestamp
     const time = new Date(liq.timestamp).toUTCString();
 
-    const message = `
+    return `
 ${emoji} *${direction} LIQUIDATED* ${directionEmoji}
 
 ${sizeEmoji} *${liq.symbol}*
@@ -237,48 +519,52 @@ ${sizeEmoji} *${liq.symbol}*
 👛 \`${shortenAddress(liq.taker)}\`
 ⏰ ${time}
 `;
-
-    return message;
   }
 
+  // Broadcast liquidation to relevant users
   async broadcastLiquidation(liq) {
-    const message = this.formatLiquidationMessage(liq);
-    
+    if (!this.useDatabase) return;
+
     this.stats.liquidationsProcessed++;
 
-    // Get subscribers (prefer database, fallback to cache)
-    const subscribers = this.useDatabase 
-      ? await db.getActiveSubscribers()
-      : Array.from(this.subscribersCache);
+    const message = this.formatLiquidationMessage(liq);
 
-    // Send to all subscribers concurrently (with rate limiting)
-    const sendPromises = subscribers.map(async (chatId) => {
+    // Get all users
+    const allUsers = await db.getAllUsers();
+
+    for (const user of allUsers) {
       try {
-        await this.bot.sendMessage(chatId, message, {
-          parse_mode: 'Markdown',
-          disable_web_page_preview: true,
-        });
-        this.stats.messagesSent++;
+        // Check if this is the user's wallet
+        const isOwnWallet = user.wallet_address && 
+          user.wallet_address.toLowerCase() === liq.taker?.toLowerCase();
+
+        if (isOwnWallet) {
+          // Always notify if it's their own liquidation
+          const ownMessage = `
+💀🚨 *YOUR POSITION WAS LIQUIDATED* 🚨💀
+
+${message}
+
+😔 Sorry for your loss. Consider using tighter risk management next time.
+          `;
+          await this.bot.sendMessage(user.chat_id, ownMessage, { parse_mode: 'Markdown' });
+          this.stats.messagesSent++;
+        } else if (user.global_alerts) {
+          // Send global alert only if enabled
+          await this.bot.sendMessage(user.chat_id, message, { parse_mode: 'Markdown' });
+          this.stats.messagesSent++;
+        }
       } catch (error) {
-        logger.error(`Failed to send to ${chatId}:`, error.message);
-        this.stats.errors++;
+        logger.error(`Failed to send to ${user.chat_id}:`, error.message);
         
-        // Remove subscriber if blocked or chat not found
         if (error.message.includes('bot was blocked') || 
-            error.message.includes('chat not found') ||
-            error.message.includes('user is deactivated')) {
-          if (this.useDatabase) {
-            await db.removeSubscriber(chatId);
-          }
-          this.subscribersCache.delete(chatId);
-          logger.info(`Removed inactive subscriber: ${chatId}`);
+            error.message.includes('chat not found')) {
+          await db.removeSubscriber(user.chat_id);
         }
       }
-    });
+    }
 
-    await Promise.all(sendPromises);
-
-    logger.info(`📨 Liquidation broadcast to ${subscribers.length} subscribers: ${liq.symbol} $${formatNumber(liq.value)}`);
+    logger.info(`📨 Liquidation broadcast: ${liq.symbol} $${formatNumber(liq.value)}`);
   }
 
   getUptime() {
@@ -288,35 +574,20 @@ ${sizeEmoji} *${liq.symbol}*
     const hours = Math.floor(minutes / 60);
     const days = Math.floor(hours / 24);
 
-    if (days > 0) {
-      return `${days}d ${hours % 24}h ${minutes % 60}m`;
-    } else if (hours > 0) {
-      return `${hours}h ${minutes % 60}m`;
-    } else if (minutes > 0) {
-      return `${minutes}m ${seconds % 60}s`;
-    } else {
-      return `${seconds}s`;
-    }
-  }
-
-  async getStats() {
-    const subscriberCount = this.useDatabase 
-      ? await db.getSubscriberCount() 
-      : this.subscribersCache.size;
-      
-    return {
-      ...this.stats,
-      subscribers: subscriberCount,
-      uptime: this.getUptime(),
-      storageType: this.useDatabase ? 'PostgreSQL' : 'In-Memory',
-    };
+    if (days > 0) return `${days}d ${hours % 24}h ${minutes % 60}m`;
+    if (hours > 0) return `${hours}h ${minutes % 60}m`;
+    if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+    return `${seconds}s`;
   }
 
   async stop() {
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+    }
     if (this.bot) {
       this.bot.stopPolling();
-      logger.info('Telegram bot stopped');
     }
     await db.close();
+    logger.info('Telegram bot stopped');
   }
 }
