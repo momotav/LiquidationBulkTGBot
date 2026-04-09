@@ -25,6 +25,12 @@ export class BulkWebSocket {
       this.ws.on('message', (data) => this.handleMessage(data));
       this.ws.on('close', (code, reason) => this.handleClose(code, reason));
       this.ws.on('error', (error) => this.handleError(error));
+      
+      // Handle ping/pong (server sends ping every 30s, we must respond with pong)
+      this.ws.on('ping', () => {
+        this.ws.pong();
+        logger.debug('Received ping, sent pong');
+      });
     } catch (error) {
       logger.error('Failed to create WebSocket connection:', error.message);
       this.scheduleReconnect();
@@ -38,62 +44,79 @@ export class BulkWebSocket {
 
     // Subscribe to trade channels for all supported markets
     this.subscribeToMarkets();
-
-    // Start ping interval to keep connection alive
-    this.startPingInterval();
   }
 
   subscribeToMarkets() {
-    const tradeChannels = this.markets.map((market) => `trade.${market}`);
+    // According to BULK API docs:
+    // { "method": "subscribe", "subscription": [{ "type": "trades", "symbol": "BTC-USD" }] }
+    const subscriptions = this.markets.map((market) => ({
+      type: 'trades',
+      symbol: market
+    }));
 
     const subscribeMessage = {
-      method: 'SUBSCRIBE',
-      params: tradeChannels,
-      id: Date.now(),
+      method: 'subscribe',
+      subscription: subscriptions
     };
 
     logger.info(`Subscribing to markets: ${this.markets.join(', ')}`);
+    logger.debug('Subscribe message:', JSON.stringify(subscribeMessage));
     this.ws.send(JSON.stringify(subscribeMessage));
   }
 
   handleMessage(rawData) {
     try {
       const data = JSON.parse(rawData.toString());
+      
+      logger.debug('WS message:', JSON.stringify(data).substring(0, 500));
 
       // Handle subscription confirmation
-      if (data.result !== undefined) {
-        logger.debug('Subscription response:', data);
+      // Response: { "type": "subscriptionResponse", "topics": ["trades.BTC-USD", ...] }
+      if (data.type === 'subscriptionResponse') {
+        logger.info(`✅ Subscribed to: ${data.topics?.join(', ')}`);
         return;
       }
 
       // Handle trade data
-      if (data.data) {
-        this.processTradeData(data.data);
+      // Format: { "type": "trades", "data": { "trades": [...] }, "topic": "trades.BTC-USD" }
+      if (data.type === 'trades' && data.data?.trades) {
+        for (const trade of data.data.trades) {
+          this.processTradeData(trade, data.topic);
+        }
       }
     } catch (error) {
       logger.error('Error parsing WebSocket message:', error.message);
-      logger.debug('Raw message:', rawData.toString());
+      logger.debug('Raw message:', rawData.toString().substring(0, 500));
     }
   }
 
-  processTradeData(trade) {
-    // Check if this is a liquidation
-    // According to docs: liq: true or reason: "liquidation"
+  processTradeData(trade, topic) {
+    // According to BULK API docs, trade fields:
+    // s: symbol, px: price, sz: size, time: timestamp, side: true=buy/false=sell
+    // reason: optional - "liquidation" or "adl" (only present if not normal trade)
+    // liq: optional - true if liquidation
+    
     const isLiquidation = trade.liq === true || trade.reason === 'liquidation';
 
     if (isLiquidation) {
+      // Extract symbol from topic (e.g., "trades.BTC-USD" -> "BTC-USD")
+      const symbol = trade.s || topic?.replace('trades.', '') || 'UNKNOWN';
+      
       const liquidation = {
-        symbol: trade.symbol || trade.market,
-        side: trade.side, // "buy" or "sell"
-        price: parseFloat(trade.price),
-        quantity: parseFloat(trade.quantity || trade.size || trade.qty),
-        value: parseFloat(trade.price) * parseFloat(trade.quantity || trade.size || trade.qty || 0),
-        taker: trade.taker, // Liquidated wallet address
-        maker: trade.maker, // Counterparty wallet
-        timestamp: trade.timestamp || Date.now(),
-        tradeId: trade.id || trade.tradeId,
+        symbol: symbol,
+        side: trade.side === true ? 'buy' : 'sell', // true = taker bought (short liquidated), false = taker sold (long liquidated)
+        price: parseFloat(trade.px || trade.price || 0),
+        quantity: parseFloat(trade.sz || trade.size || trade.qty || 0),
+        value: 0,
+        taker: trade.taker,
+        maker: trade.maker,
+        timestamp: trade.time || Date.now(),
       };
+      
+      // Calculate value
+      liquidation.value = liquidation.price * liquidation.quantity;
 
+      logger.info(`🔴 LIQUIDATION DETECTED: ${symbol} ${liquidation.side} $${liquidation.value.toFixed(2)}`);
       logger.liquidation(liquidation);
 
       // Call the callback to broadcast to Telegram
@@ -101,14 +124,16 @@ export class BulkWebSocket {
         this.onLiquidation(liquidation);
       }
     } else {
-      logger.debug(`Trade (not liquidation): ${trade.symbol} ${trade.side} @ ${trade.price}`);
+      // Normal trade - just debug log
+      const symbol = trade.s || topic?.replace('trades.', '') || '?';
+      const side = trade.side === true ? 'BUY' : 'SELL';
+      logger.debug(`Trade: ${symbol} ${side} ${trade.sz} @ ${trade.px}`);
     }
   }
 
   handleClose(code, reason) {
     logger.warn(`WebSocket closed. Code: ${code}, Reason: ${reason || 'No reason provided'}`);
     this.isConnected = false;
-    this.stopPingInterval();
     this.scheduleReconnect();
   }
 
@@ -133,25 +158,7 @@ export class BulkWebSocket {
     }, delay);
   }
 
-  startPingInterval() {
-    // Send ping every 30 seconds to keep connection alive
-    this.pingInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.ping();
-        logger.debug('Ping sent');
-      }
-    }, 30000);
-  }
-
-  stopPingInterval() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-  }
-
   disconnect() {
-    this.stopPingInterval();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
