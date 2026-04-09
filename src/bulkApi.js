@@ -11,6 +11,11 @@ export class BulkAPI {
   async fetch(endpoint, options = {}) {
     const url = `${this.baseUrl}${endpoint}`;
     
+    logger.debug(`API Request: ${options.method || 'GET'} ${url}`);
+    if (options.body) {
+      logger.debug(`Request body: ${options.body}`);
+    }
+
     try {
       const response = await fetch(url, {
         headers: {
@@ -20,11 +25,18 @@ export class BulkAPI {
         ...options,
       });
 
+      const text = await response.text();
+      logger.debug(`API Response (${response.status}): ${text.substring(0, 500)}`);
+
       if (!response.ok) {
-        throw new Error(`API error: ${response.status} ${response.statusText}`);
+        throw new Error(`API error: ${response.status} ${response.statusText} - ${text}`);
       }
 
-      return await response.json();
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
     } catch (error) {
       logger.error(`BULK API error (${endpoint}):`, error.message);
       throw error;
@@ -38,26 +50,83 @@ export class BulkAPI {
     if (cached) return cached;
 
     try {
-      const response = await this.fetch('/positions', {
-        method: 'POST',
-        body: JSON.stringify({
-          account: walletAddress,
-        }),
-      });
+      // Try different endpoint formats
+      let response;
+      let positions = [];
 
-      // Parse response - adjust based on actual API response format
-      const positions = response.positions || response.data || response || [];
-      
+      // Attempt 1: POST to /positions with account in body
+      try {
+        response = await this.fetch('/positions', {
+          method: 'POST',
+          body: JSON.stringify({
+            account: walletAddress,
+          }),
+        });
+        logger.debug('Positions response (POST /positions):', JSON.stringify(response));
+      } catch (e) {
+        logger.debug('POST /positions failed, trying alternatives...');
+      }
+
+      // Attempt 2: GET with query parameter
+      if (!response) {
+        try {
+          response = await this.fetch(`/positions?account=${walletAddress}`);
+          logger.debug('Positions response (GET /positions?account=):', JSON.stringify(response));
+        } catch (e) {
+          logger.debug('GET /positions?account= failed, trying alternatives...');
+        }
+      }
+
+      // Attempt 3: GET with wallet in path
+      if (!response) {
+        try {
+          response = await this.fetch(`/positions/${walletAddress}`);
+          logger.debug('Positions response (GET /positions/:wallet):', JSON.stringify(response));
+        } catch (e) {
+          logger.debug('GET /positions/:wallet failed');
+        }
+      }
+
+      if (!response) {
+        logger.error('All position fetch attempts failed');
+        return [];
+      }
+
+      // Parse response - handle different possible formats
+      if (Array.isArray(response)) {
+        positions = response;
+      } else if (response.positions) {
+        positions = response.positions;
+      } else if (response.data) {
+        positions = Array.isArray(response.data) ? response.data : [response.data];
+      } else if (response.result) {
+        positions = Array.isArray(response.result) ? response.result : [response.result];
+      } else if (typeof response === 'object' && response !== null) {
+        // Maybe the response itself is a single position or keyed by symbol
+        const keys = Object.keys(response);
+        if (keys.length > 0 && keys[0].includes('-')) {
+          // Keyed by symbol like { "BTC-USD": { ... } }
+          positions = keys.map(symbol => ({ symbol, ...response[symbol] }));
+        } else if (response.symbol || response.size || response.market) {
+          // Single position object
+          positions = [response];
+        }
+      }
+
+      logger.info(`Found ${positions.length} positions for ${walletAddress.substring(0, 8)}...`);
+
       // Normalize position data
-      const normalizedPositions = positions.map(pos => ({
-        symbol: pos.symbol || pos.market,
-        size: parseFloat(pos.size || pos.quantity || 0),
-        entryPrice: parseFloat(pos.entryPrice || pos.entry_price || pos.avgEntryPrice || 0),
-        unrealizedPnl: parseFloat(pos.unrealizedPnl || pos.unrealized_pnl || pos.pnl || 0),
-        marginUsed: parseFloat(pos.marginUsed || pos.margin_used || pos.margin || 0),
-        liquidationPrice: pos.liquidationPrice || pos.liquidation_price || pos.liqPrice || null,
-        leverage: parseFloat(pos.leverage || 20),
-      }));
+      const normalizedPositions = positions
+        .filter(pos => pos && (pos.size || pos.quantity || pos.amount))
+        .map(pos => ({
+          symbol: pos.symbol || pos.market || pos.pair || 'UNKNOWN',
+          size: parseFloat(pos.size || pos.quantity || pos.amount || 0),
+          entryPrice: parseFloat(pos.entryPrice || pos.entry_price || pos.avgEntryPrice || pos.avg_entry_price || pos.averagePrice || 0),
+          unrealizedPnl: parseFloat(pos.unrealizedPnl || pos.unrealized_pnl || pos.pnl || pos.uPnl || 0),
+          marginUsed: parseFloat(pos.marginUsed || pos.margin_used || pos.margin || pos.collateral || 0),
+          liquidationPrice: parseFloat(pos.liquidationPrice || pos.liquidation_price || pos.liqPrice || pos.liq_price || 0) || null,
+          leverage: parseFloat(pos.leverage || 20),
+        }));
 
       this.setCache(cacheKey, normalizedPositions);
       return normalizedPositions;
@@ -74,37 +143,41 @@ export class BulkAPI {
     if (cached) return cached;
 
     try {
-      const response = await this.fetch(`/ticker/${symbol}`);
-      
+      let response;
+
+      // Try different endpoint formats
+      try {
+        response = await this.fetch(`/ticker/${symbol}`);
+      } catch (e) {
+        try {
+          response = await this.fetch(`/ticker?symbol=${symbol}`);
+        } catch (e2) {
+          response = await this.fetch(`/markets/${symbol}`);
+        }
+      }
+
+      logger.debug(`Mark price response for ${symbol}:`, JSON.stringify(response));
+
       const markPrice = parseFloat(
         response.markPrice || 
         response.mark_price || 
         response.price || 
         response.lastPrice ||
+        response.last_price ||
+        response.last ||
+        response.mid ||
+        response.midPrice ||
         0
       );
 
-      this.setCache(cacheKey, markPrice);
+      if (markPrice > 0) {
+        this.setCache(cacheKey, markPrice);
+      }
+      
       return markPrice;
     } catch (error) {
       logger.error(`Failed to get mark price for ${symbol}:`, error.message);
       return 0;
-    }
-  }
-
-  // Get all tickers
-  async getAllTickers() {
-    const cacheKey = 'all_tickers';
-    const cached = this.getFromCache(cacheKey);
-    if (cached) return cached;
-
-    try {
-      const response = await this.fetch('/tickers');
-      this.setCache(cacheKey, response);
-      return response;
-    } catch (error) {
-      logger.error('Failed to get tickers:', error.message);
-      return {};
     }
   }
 
