@@ -48,26 +48,15 @@ export class TelegramBotClient {
   }
 
   setupCommands() {
-    // Main menu keyboard
-    const mainMenuKeyboard = {
-      inline_keyboard: [
-        [
-          { text: '📊 Wallet Status', callback_data: 'wallet_status' },
-          { text: '🔗 Connect Wallet', callback_data: 'connect_wallet' }
-        ],
-        [
-          { text: '🔔 Alerts On', callback_data: 'alerts_on' },
-          { text: '🔕 Alerts Off', callback_data: 'alerts_off' }
-        ],
-        [
-          { text: '📈 Markets', callback_data: 'markets' },
-          { text: '📉 Status', callback_data: 'status' }
-        ],
-        [
-          { text: '❓ Help', callback_data: 'help' },
-          { text: '🗑️ Remove Wallet', callback_data: 'remove_wallet' }
-        ]
-      ]
+    // Persistent keyboard at bottom of screen
+    const persistentKeyboard = {
+      keyboard: [
+        ['📊 Wallet Status', '🔗 Connect Wallet'],
+        ['🔔 Alerts On', '🔕 Alerts Off'],
+        ['📈 Markets', '📉 Status', '❓ Help']
+      ],
+      resize_keyboard: true,  // Makes buttons smaller
+      persistent: true
     };
 
     // /start command
@@ -91,37 +80,35 @@ I'll notify you about liquidations on BULK Exchange and warn you when your posit
 
 📊 *Monitoring:* ${config.bulk.markets.join(', ')}
 
-Use the menu below or type commands:
+Use the menu below 👇
       `;
 
       this.bot.sendMessage(chatId, welcomeMessage, { 
         parse_mode: 'Markdown',
-        reply_markup: mainMenuKeyboard
+        reply_markup: persistentKeyboard
       });
     });
 
-    // /menu command - Show menu anytime
+    // /menu command - Show keyboard again if hidden
     this.bot.onText(/\/menu/, async (msg) => {
       const chatId = msg.chat.id;
-      this.bot.sendMessage(chatId, '📋 *Main Menu*\n\nChoose an option:', { 
-        parse_mode: 'Markdown',
-        reply_markup: mainMenuKeyboard
+      this.bot.sendMessage(chatId, '📋 Menu activated! Use the buttons below 👇', { 
+        reply_markup: persistentKeyboard
       });
     });
 
-    // Handle button callbacks
-    this.bot.on('callback_query', async (query) => {
-      const chatId = query.message.chat.id;
-      const data = query.data;
+    // Handle keyboard button presses (they send text messages)
+    this.bot.on('message', async (msg) => {
+      if (!msg.text || msg.text.startsWith('/')) return;
+      
+      const chatId = msg.chat.id;
+      const text = msg.text;
 
-      // Acknowledge the button press
-      this.bot.answerCallbackQuery(query.id);
-
-      switch (data) {
-        case 'wallet_status':
+      switch (text) {
+        case '📊 Wallet Status':
           await this.handleWalletStatus(chatId);
           break;
-        case 'connect_wallet':
+        case '🔗 Connect Wallet':
           this.bot.sendMessage(chatId, `
 🔗 *Connect Your Wallet*
 
@@ -132,23 +119,20 @@ Example:
 \`/wallet 7xK9f2AbCdEf123456789...\`
           `, { parse_mode: 'Markdown' });
           break;
-        case 'alerts_on':
+        case '🔔 Alerts On':
           await this.handleAlertsToggle(chatId, true);
           break;
-        case 'alerts_off':
+        case '🔕 Alerts Off':
           await this.handleAlertsToggle(chatId, false);
           break;
-        case 'markets':
+        case '📈 Markets':
           await this.handleMarkets(chatId);
           break;
-        case 'status':
+        case '📉 Status':
           await this.handleStatus(chatId);
           break;
-        case 'help':
+        case '❓ Help':
           await this.handleHelp(chatId);
-          break;
-        case 'remove_wallet':
-          await this.handleRemoveWallet(chatId);
           break;
       }
     });
