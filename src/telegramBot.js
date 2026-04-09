@@ -179,12 +179,14 @@ No open positions found.
         let positionsText = '';
 
         for (const pos of positions) {
-          const markPrice = await this.bulkApi.getMarkPrice(pos.symbol);
+          // Use markPrice from position data (fairPrice), fallback to fetching if not available
+          const markPrice = pos.markPrice || await this.bulkApi.getMarkPrice(pos.symbol);
           const risk = this.calculateLiquidationRisk(pos, markPrice);
           
           const direction = pos.size > 0 ? '🟢 LONG' : '🔴 SHORT';
           const riskEmoji = risk.distancePercent < 5 ? '🚨' : risk.distancePercent < 10 ? '⚠️' : '✅';
-          const notionalValue = Math.abs(pos.size) * markPrice;
+          // Use notional from API if available, otherwise calculate
+          const notionalValue = pos.notional || Math.abs(pos.size) * markPrice;
 
           positionsText += `
 *${pos.symbol}* ${direction}
@@ -192,7 +194,7 @@ No open positions found.
 📊 Size: ${formatNumber(Math.abs(pos.size))} (${formatNumberPrecise(notionalValue)} USD)
 💲 Entry: $${formatNumberPrecise(pos.entryPrice)}
 📍 Mark: $${formatNumberPrecise(markPrice)}
-🎯 Liq Price: $${formatNumberPrecise(risk.liquidationPrice)}
+🎯 Liq Price: $${formatNumberPrecise(pos.liquidationPrice || risk.liquidationPrice)}
 ${riskEmoji} Distance: *${risk.distancePercent.toFixed(2)}%*
 💰 uPnL: ${pos.unrealizedPnl >= 0 ? '+' : ''}$${formatNumberPrecise(pos.unrealizedPnl)}
 
