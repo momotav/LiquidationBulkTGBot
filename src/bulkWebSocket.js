@@ -11,7 +11,6 @@ export class BulkWebSocket {
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
-    this.pingInterval = null;
     this.isConnected = false;
   }
 
@@ -47,77 +46,76 @@ export class BulkWebSocket {
   }
 
   subscribeToMarkets() {
-    // According to BULK API docs:
-    // { "method": "subscribe", "subscription": [{ "type": "trades", "symbol": "BTC-USD" }] }
-    const subscriptions = this.markets.map((market) => ({
-      type: 'trades',
-      symbol: market
-    }));
+    // Format: trade.BTC-USD, trade.ETH-USD, etc.
+    const streams = this.markets.map((market) => `trade.${market}`);
 
     const subscribeMessage = {
-      method: 'subscribe',
-      subscription: subscriptions
+      method: 'SUBSCRIBE',
+      params: streams,
+      id: Date.now()
     };
 
-    logger.info(`Subscribing to markets: ${this.markets.join(', ')}`);
+    logger.info(`Subscribing to: ${streams.join(', ')}`);
     logger.debug('Subscribe message:', JSON.stringify(subscribeMessage));
     this.ws.send(JSON.stringify(subscribeMessage));
   }
 
   handleMessage(rawData) {
     try {
-      const data = JSON.parse(rawData.toString());
+      const msg = JSON.parse(rawData.toString());
       
-      logger.debug('WS message:', JSON.stringify(data).substring(0, 500));
+      logger.debug('WS message:', JSON.stringify(msg).substring(0, 500));
 
-      // Handle subscription confirmation
-      // Response: { "type": "subscriptionResponse", "topics": ["trades.BTC-USD", ...] }
-      if (data.type === 'subscriptionResponse') {
-        logger.info(`✅ Subscribed to: ${data.topics?.join(', ')}`);
+      // Skip subscription confirmations and other non-trade messages
+      if (!msg.data || !msg.data.price) {
+        // Could be subscription response
+        if (msg.result !== undefined || msg.id) {
+          logger.info('Subscription confirmed');
+        }
         return;
       }
 
-      // Handle trade data
-      // Format: { "type": "trades", "data": { "trades": [...] }, "topic": "trades.BTC-USD" }
-      if (data.type === 'trades' && data.data?.trades) {
-        for (const trade of data.data.trades) {
-          this.processTradeData(trade, data.topic);
-        }
-      }
+      const trade = msg.data;
+      this.processTradeData(trade);
+      
     } catch (error) {
       logger.error('Error parsing WebSocket message:', error.message);
       logger.debug('Raw message:', rawData.toString().substring(0, 500));
     }
   }
 
-  processTradeData(trade, topic) {
-    // According to BULK API docs, trade fields:
-    // s: symbol, px: price, sz: size, time: timestamp, side: true=buy/false=sell
-    // reason: optional - "liquidation" or "adl" (only present if not normal trade)
-    // liq: optional - true if liquidation
-    
+  processTradeData(trade) {
+    // Check for liquidation
+    // Primary: trade.liq === true
+    // Backup: trade.reason === 'liquidation'
     const isLiquidation = trade.liq === true || trade.reason === 'liquidation';
 
     if (isLiquidation) {
-      // Extract symbol from topic (e.g., "trades.BTC-USD" -> "BTC-USD")
-      const symbol = trade.s || topic?.replace('trades.', '') || 'UNKNOWN';
+      // TAKER = the wallet that got liquidated
+      // MAKER = just someone who had a resting order (ignore)
       
-      const liquidation = {
-        symbol: symbol,
-        side: trade.side === true ? 'buy' : 'sell', // true = taker bought (short liquidated), false = taker sold (long liquidated)
-        price: parseFloat(trade.px || trade.price || 0),
-        quantity: parseFloat(trade.sz || trade.size || trade.qty || 0),
-        value: 0,
-        taker: trade.taker,
-        maker: trade.maker,
-        timestamp: trade.time || Date.now(),
-      };
+      // Determine position type from side:
+      // side="sell" → LONG liquidated (forced to sell their long)
+      // side="buy"  → SHORT liquidated (forced to buy back their short)
+      const positionType = trade.side === 'sell' ? 'LONG' : 'SHORT';
       
-      // Calculate value
-      liquidation.value = liquidation.price * liquidation.quantity;
+      const price = parseFloat(trade.price || 0);
+      const quantity = parseFloat(trade.quantity || trade.size || trade.sz || 0);
+      const valueUsd = price * quantity;
 
-      logger.info(`🔴 LIQUIDATION DETECTED: ${symbol} ${liquidation.side} $${liquidation.value.toFixed(2)}`);
-      logger.liquidation(liquidation);
+      const liquidation = {
+        symbol: trade.symbol,
+        side: trade.side,                    // "buy" or "sell"
+        positionType: positionType,          // "LONG" or "SHORT"
+        price: price,
+        quantity: quantity,
+        value: valueUsd,
+        taker: trade.taker,                  // LIQUIDATED WALLET
+        maker: trade.maker,                  // Counterparty (ignore)
+        timestamp: trade.timestamp || Date.now(),
+      };
+
+      logger.info(`🔥 LIQUIDATION: ${positionType} ${trade.symbol} $${valueUsd.toFixed(2)} | Wallet: ${trade.taker?.substring(0, 8)}...`);
 
       // Call the callback to broadcast to Telegram
       if (this.onLiquidation) {
@@ -125,9 +123,7 @@ export class BulkWebSocket {
       }
     } else {
       // Normal trade - just debug log
-      const symbol = trade.s || topic?.replace('trades.', '') || '?';
-      const side = trade.side === true ? 'BUY' : 'SELL';
-      logger.debug(`Trade: ${symbol} ${side} ${trade.sz} @ ${trade.px}`);
+      logger.debug(`Trade: ${trade.symbol} ${trade.side} ${trade.quantity || trade.size} @ ${trade.price}`);
     }
   }
 
@@ -139,7 +135,6 @@ export class BulkWebSocket {
 
   handleError(error) {
     logger.error('WebSocket error:', error.message);
-    // Don't reconnect here, the close event will handle it
   }
 
   scheduleReconnect() {
