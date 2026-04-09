@@ -9,7 +9,7 @@ export const config = {
   bulk: {
     wsUrl: process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade',
     apiUrl: process.env.BULK_API_URL || 'https://exchange-api.bulk.trade/api/v1',
-    markets: (process.env.SUPPORTED_MARKETS || 'BTC-USD,ETH-USD,SOL-USD,GOLD-USD,XRP-USD').split(','),
+    markets: (process.env.SUPPORTED_MARKETS || 'BTC-USD,ETH-USD,SOL-USD').split(','),
   },
   alerts: {
     defaultThreshold: parseFloat(process.env.DEFAULT_ALERT_THRESHOLD || '5'),
