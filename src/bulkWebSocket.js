@@ -214,7 +214,7 @@ export class BulkWebSocket {
       timestamp: time,
     };
 
-    logger.info(`🔥 LIQUIDATION: ${liquidatorSide} ${symbol} $${value.toFixed(2)} | Wallet: ${liquidatedWallet?.substring(0, 8) || 'unknown'}...`);
+    logger.info(`🔥 LIQUIDATION: ${liquidatorSide} ${symbol} $${value.toFixed(2)} | Wallet: ${liquidatedWallet || 'unknown'}`);
 
     // Call the callback to broadcast to Telegram
     if (this.onLiquidation) {
