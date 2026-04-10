@@ -439,7 +439,11 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
 🦈 = $50k-$100k 
 🐟 = $10k-$50k
 🦐 = Under $10k
-      `, { parse_mode: 'Markdown' });
+
+*Links:*
+• [BULK Exchange](https://alphanet.bulk.trade)
+• [Explorer](https://explorer.bulk.trade)
+      `, { parse_mode: 'Markdown', disable_web_page_preview: true });
     });
 
     // Handle errors
@@ -650,7 +654,11 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
 🦈 = $50k-$100k 
 🐟 = $10k-$50k
 🦐 = Under $10k
-    `, { parse_mode: 'Markdown' });
+
+*Links:*
+• [BULK Exchange](https://alphanet.bulk.trade)
+• [Explorer](https://explorer.bulk.trade)
+    `, { parse_mode: 'Markdown', disable_web_page_preview: true });
   }
 
   // Handler for remove wallet
@@ -816,9 +824,7 @@ Consider adding margin or reducing position size.
 
   // Format liquidation message
   formatLiquidationMessage(liq) {
-    // side="sell" → LONG liquidated (forced to sell their long)
-    // side="buy"  → SHORT liquidated (forced to buy back their short)
-    // Or use positionType if available
+    // Use positionType from WebSocket if available
     const positionType = liq.positionType || (liq.side === 'sell' ? 'LONG' : 'SHORT');
     const isLongLiquidated = positionType === 'LONG';
     
@@ -834,6 +840,10 @@ Consider adding margin or reducing position size.
 
     const token = liq.symbol.split('-')[0];
     const time = new Date(liq.timestamp).toUTCString();
+    
+    // Show which role got liquidated and both wallets
+    const liquidatedWallet = liq.liquidatedWallet || liq.taker;
+    const role = liq.liquidatedRole ? liq.liquidatedRole.toUpperCase() : 'TAKER';
 
     return `
 ${emoji} *${direction} LIQUIDATED* ${directionEmoji}
@@ -844,7 +854,9 @@ ${sizeEmoji} *${liq.symbol}*
 💲 *Price:* $${formatNumberPrecise(liq.price)}
 📊 *Qty:* ${formatNumber(liq.quantity)} ${token}
 ━━━━━━━━━━━━━━━━━━━
-👛 \`${shortenAddress(liq.taker)}\`
+🎯 *${role}:* \`${shortenAddress(liquidatedWallet)}\`
+👤 Taker: \`${shortenAddress(liq.taker)}\`
+🏪 Maker: \`${shortenAddress(liq.maker)}\`
 ⏰ ${time}
 `;
   }
