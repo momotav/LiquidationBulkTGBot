@@ -681,11 +681,26 @@ Use /wallet \`<address>\` to connect a new wallet.
   // 0% = at entry (safe), 100% = at liquidation (dead)
   calculateLiquidationRisk(position, markPrice) {
     const { entryPrice, size, liquidationPrice } = position;
+    
+    // Validate inputs
+    if (!markPrice || markPrice <= 0 || !entryPrice || entryPrice <= 0) {
+      logger.warn(`Invalid prices - mark: ${markPrice}, entry: ${entryPrice}`);
+      return {
+        liquidationPrice: 0,
+        currentPrice: markPrice || 0,
+        entryPrice: entryPrice || 0,
+        percentTowardLiquidation: 0,
+        rawPercentTowardLiquidation: 0,
+        isAtRisk: false,
+        distancePercent: 0
+      };
+    }
+    
     const isLong = size > 0;
     
     // If no liquidation price provided, estimate it
     let liqPrice = liquidationPrice;
-    if (!liqPrice || liqPrice === 0) {
+    if (!liqPrice || liqPrice <= 0) {
       // Rough estimate based on 20x leverage, 0.5% maintenance margin
       const maintenanceMargin = 0.005; // 0.5%
       if (isLong) {
@@ -698,9 +713,21 @@ Use /wallet \`<address>\` to connect a new wallet.
     // Calculate the total distance from entry to liquidation
     const totalDistance = Math.abs(liqPrice - entryPrice);
     
+    // Prevent division by zero
+    if (totalDistance === 0) {
+      return {
+        liquidationPrice: liqPrice,
+        currentPrice: markPrice,
+        entryPrice: entryPrice,
+        percentTowardLiquidation: 0,
+        rawPercentTowardLiquidation: 0,
+        isAtRisk: false,
+        distancePercent: 0
+      };
+    }
+    
     // Calculate how far price has moved from entry toward liquidation
     let distanceTraveled;
-    let percentTowardLiquidation;
     
     if (isLong) {
       // LONG: Entry is high, liq is low
@@ -718,26 +745,22 @@ Use /wallet \`<address>\` to connect a new wallet.
     // Negative = in profit (price moved away from liq)
     // 0% = at entry
     // 100% = at liquidation
-    if (totalDistance > 0) {
-      percentTowardLiquidation = (distanceTraveled / totalDistance) * 100;
-    } else {
-      percentTowardLiquidation = 0;
-    }
+    const percentTowardLiquidation = (distanceTraveled / totalDistance) * 100;
     
-    // isAtRisk when 80% or more toward liquidation (configurable via threshold)
-    // Default threshold is stored as "warn when X% toward liquidation"
-    const warningThreshold = 80; // Warn when 80% of the way to liquidation
-    const isAtRisk = percentTowardLiquidation >= warningThreshold;
+    // isAtRisk when 80% or more toward liquidation
+    const warningThreshold = 80;
+    // Only consider at risk if percentage is reasonable (0-100%)
+    const isAtRisk = percentTowardLiquidation >= warningThreshold && percentTowardLiquidation <= 100;
     
     return {
       liquidationPrice: liqPrice,
       currentPrice: markPrice,
       entryPrice: entryPrice,
-      percentTowardLiquidation: Math.max(0, percentTowardLiquidation), // Cap at 0 for display (in profit)
+      percentTowardLiquidation: Math.max(0, Math.min(100, percentTowardLiquidation)), // Cap between 0-100 for display
       rawPercentTowardLiquidation: percentTowardLiquidation, // Can be negative (in profit)
       isAtRisk: isAtRisk,
       // For backwards compatibility, also include distance from liq price
-      distancePercent: Math.abs((liqPrice - markPrice) / markPrice) * 100
+      distancePercent: markPrice > 0 ? Math.abs((liqPrice - markPrice) / markPrice) * 100 : 0
     };
   }
 
@@ -765,8 +788,33 @@ Use /wallet \`<address>\` to connect a new wallet.
           if (!positions || positions.length === 0) continue;
 
           for (const pos of positions) {
-            const markPrice = await this.bulkApi.getMarkPrice(pos.symbol);
+            // Use markPrice from position data (fairPrice), fallback to API call
+            let markPrice = pos.markPrice;
+            
+            if (!markPrice || markPrice <= 0) {
+              markPrice = await this.bulkApi.getMarkPrice(pos.symbol);
+            }
+            
+            // Skip if we still don't have a valid mark price
+            if (!markPrice || markPrice <= 0) {
+              logger.warn(`Skipping ${pos.symbol} - no valid mark price`);
+              continue;
+            }
+            
+            // Skip if entry price is invalid
+            if (!pos.entryPrice || pos.entryPrice <= 0) {
+              logger.warn(`Skipping ${pos.symbol} - no valid entry price`);
+              continue;
+            }
+            
             const risk = this.calculateLiquidationRisk(pos, markPrice);
+            
+            // Skip if risk calculation returned invalid data
+            if (!risk || risk.percentTowardLiquidation < 0 || risk.percentTowardLiquidation > 100) {
+              // If > 100%, they should already be liquidated, don't send weird alerts
+              logger.debug(`Skipping ${pos.symbol} - invalid risk: ${risk?.percentTowardLiquidation}%`);
+              continue;
+            }
 
             // Alert if 80% or more toward liquidation
             if (risk.isAtRisk) {
