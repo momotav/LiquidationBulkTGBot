@@ -161,60 +161,69 @@ export class BulkWebSocket {
     // BULK system liquidator wallet - this is the exchange's liquidation engine
     const LIQUIDATOR_WALLET = '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt';
     
-    // Determine who got liquidated:
-    // - If taker is the liquidator → maker got liquidated
-    // - If maker is the liquidator → taker got liquidated
-    // - If neither is liquidator → taker got liquidated (original logic)
+    const taker = trade.taker || null;
+    const maker = trade.maker || null;
+    
+    // Skip if taker is the system liquidator (we want to see the other side)
+    // But DON'T skip MM wallet - dev wants to see those
+    if (taker === LIQUIDATOR_WALLET && !maker) {
+      logger.debug('Skipping - only system liquidator, no counterparty');
+      return;
+    }
+    
+    // Determine who got liquidated based on who the liquidator is
     let liquidatedWallet;
-    let liquidatorSide; // The side the LIQUIDATED person was on
+    let liquidatedRole; // 'taker' or 'maker'
     
-    if (trade.taker === LIQUIDATOR_WALLET) {
-      // Liquidator is buying/selling FROM the maker → maker got liquidated
-      liquidatedWallet = trade.maker;
-      // If liquidator is BUYING (taker side = buy), the maker was SHORT (liquidator buying to close their short)
-      // If liquidator is SELLING (taker side = sell), the maker was LONG (liquidator selling to close their long)
-      const takerSide = trade.side === true || trade.side === 'B' || trade.side === 'buy' ? 'buy' : 'sell';
-      liquidatorSide = takerSide === 'buy' ? 'SHORT' : 'LONG';
-    } else if (trade.maker === LIQUIDATOR_WALLET) {
-      // Liquidator is the maker → taker got liquidated
-      liquidatedWallet = trade.taker;
-      const takerSide = trade.side === true || trade.side === 'B' || trade.side === 'buy' ? 'buy' : 'sell';
-      // Taker's side tells us what position they had:
-      // If taker is BUYING, they were SHORT (buying to close)
-      // If taker is SELLING, they were LONG (selling to close)
-      liquidatorSide = takerSide === 'buy' ? 'SHORT' : 'LONG';
+    if (taker === LIQUIDATOR_WALLET) {
+      // System liquidator is taker → maker got liquidated
+      liquidatedWallet = maker;
+      liquidatedRole = 'maker';
+    } else if (maker === LIQUIDATOR_WALLET) {
+      // System liquidator is maker → taker got liquidated
+      liquidatedWallet = taker;
+      liquidatedRole = 'taker';
     } else {
-      // Neither is the known liquidator - use taker as liquidated (original logic)
-      liquidatedWallet = trade.taker;
-      const takerSide = trade.side === true || trade.side === 'B' || trade.side === 'buy' ? 'buy' : 'sell';
-      liquidatorSide = takerSide === 'buy' ? 'SHORT' : 'LONG';
+      // Neither is system liquidator - taker is usually the liquidated one
+      liquidatedWallet = taker;
+      liquidatedRole = 'taker';
     }
     
-    // Skip if we couldn't determine the liquidated wallet
-    if (!liquidatedWallet) {
-      logger.warn('Could not determine liquidated wallet, skipping');
-      return;
-    }
+    // Determine position type from trade side
+    // If the liquidation trade is a BUY, the liquidated party was SHORT
+    // If the liquidation trade is a SELL, the liquidated party was LONG
+    const tradeSide = trade.side === true || trade.side === 'B' || trade.side === 'buy' ? 'buy' : 'sell';
     
-    // Skip if the "liquidated" wallet is actually the liquidator (shouldn't happen but safety check)
-    if (liquidatedWallet === LIQUIDATOR_WALLET) {
-      logger.debug('Skipping - liquidated wallet is the system liquidator');
-      return;
+    // The side depends on who got liquidated:
+    // - If TAKER got liquidated: taker's side tells us their position
+    //   - taker BUY = was SHORT (buying to close)
+    //   - taker SELL = was LONG (selling to close)
+    // - If MAKER got liquidated: opposite of taker's side
+    //   - taker BUY (maker SELL) = maker was LONG (got sold into)
+    //   - taker SELL (maker BUY) = maker was SHORT (got bought into)
+    let positionType;
+    if (liquidatedRole === 'taker') {
+      positionType = tradeSide === 'buy' ? 'SHORT' : 'LONG';
+    } else {
+      // Maker got liquidated - opposite side
+      positionType = tradeSide === 'buy' ? 'LONG' : 'SHORT';
     }
 
     const liquidation = {
       symbol: symbol,
-      side: trade.side,
-      positionType: liquidatorSide,
+      side: tradeSide,
+      positionType: positionType,
       price: price,
       quantity: Math.abs(size),
       value: value,
-      taker: liquidatedWallet,  // The wallet that got liquidated (renamed for compatibility)
-      maker: trade.maker,
+      taker: taker,
+      maker: maker,
+      liquidatedWallet: liquidatedWallet,
+      liquidatedRole: liquidatedRole,  // 'taker' or 'maker'
       timestamp: time,
     };
 
-    logger.info(`🔥 LIQUIDATION: ${liquidatorSide} ${symbol} $${value.toFixed(2)} | Wallet: ${liquidatedWallet || 'unknown'}`);
+    logger.info(`🔥 LIQUIDATION: ${positionType} ${symbol} $${value.toFixed(2)} | ${liquidatedRole.toUpperCase()}: ${liquidatedWallet || 'unknown'}`);
 
     // Call the callback to broadcast to Telegram
     if (this.onLiquidation) {
