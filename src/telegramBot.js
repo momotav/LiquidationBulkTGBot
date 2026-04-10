@@ -439,11 +439,7 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
 🦈 = $50k-$100k 
 🐟 = $10k-$50k
 🦐 = Under $10k
-
-*Links:*
-• [BULK Exchange](https://alphanet.bulk.trade)
-• [Explorer](https://explorer.bulk.trade)
-      `, { parse_mode: 'Markdown', disable_web_page_preview: true });
+      `, { parse_mode: 'Markdown' });
     });
 
     // Handle errors
@@ -654,11 +650,7 @@ Connect your wallet to get personal alerts when YOUR positions are at risk.
 🦈 = $50k-$100k 
 🐟 = $10k-$50k
 🦐 = Under $10k
-
-*Links:*
-• [BULK Exchange](https://alphanet.bulk.trade)
-• [Explorer](https://explorer.bulk.trade)
-    `, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    `, { parse_mode: 'Markdown' });
   }
 
   // Handler for remove wallet
